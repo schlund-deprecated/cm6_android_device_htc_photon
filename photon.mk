@@ -106,7 +106,7 @@ PRODUCT_PACKAGES += \
 
 PRODUCT_COPY_FILES += \
     device/htc/photon/vold.fstab:system/etc/vold.fstab \
-    device/common/gps/gps.conf_US:system/etc/gps.conf
+    device/common/gps/gps.conf_EU:system/etc/gps.conf
 
 PRODUCT_COPY_FILES += \
     device/htc/photon/bcm4329.ko:system/lib/modules/bcm4329.ko \

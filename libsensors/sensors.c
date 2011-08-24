@@ -28,7 +28,7 @@
 #include <sys/select.h>
 
 #include <linux/input.h>
-#include <linux/akm8973.h>
+#include "bma150.h"
 #include <linux/capella_cm3602.h>
 #include <linux/lightsensor.h>
 
@@ -38,35 +38,30 @@
 
 #define __MAX(a,b) ((a)>=(b)?(a):(b))
 
+
 /*****************************************************************************/
 
-#define MAX_NUM_SENSORS 6
+#define MAX_NUM_SENSORS 4//6
 
 #define SUPPORTED_SENSORS  ((1<<MAX_NUM_SENSORS)-1)
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 
 #define ID_A  (0)
-#define ID_M  (1)
-#define ID_O  (2)
-#define ID_T  (3)
-#define ID_P  (4)
-#define ID_L  (5)
+#define ID_T  (1)
+#define ID_P  (2)
+#define ID_L  (3)
 
 static int id_to_sensor[MAX_NUM_SENSORS] = {
     [ID_A] = SENSOR_TYPE_ACCELEROMETER,
-    [ID_M] = SENSOR_TYPE_MAGNETIC_FIELD,
-    [ID_O] = SENSOR_TYPE_ORIENTATION,
     [ID_T] = SENSOR_TYPE_TEMPERATURE,
     [ID_P] = SENSOR_TYPE_PROXIMITY,
     [ID_L] = SENSOR_TYPE_LIGHT,
 };
 
 #define SENSORS_AKM_ACCELERATION   (1<<ID_A)
-#define SENSORS_AKM_MAGNETIC_FIELD (1<<ID_M)
-#define SENSORS_AKM_ORIENTATION    (1<<ID_O)
 #define SENSORS_AKM_TEMPERATURE    (1<<ID_T)
-#define SENSORS_AKM_GROUP          ((1<<ID_A)|(1<<ID_M)|(1<<ID_O)|(1<<ID_T))
+#define SENSORS_AKM_GROUP          ((1<<ID_A)|(1<<ID_T))
 
 #define SENSORS_CM_PROXIMITY       (1<<ID_P)
 #define SENSORS_CM_GROUP           (1<<ID_P)
@@ -78,7 +73,7 @@ static int id_to_sensor[MAX_NUM_SENSORS] = {
 
 struct sensors_control_context_t {
     struct sensors_control_device_t device; // must be first
-    int akmd_fd;
+	int bma_fd;
     int cmd_fd;
     int lsd_fd;
     uint32_t active_sensors;
@@ -110,14 +105,12 @@ static const struct sensor_t sSensorList[] = {
                 "Bosh",
                 1, SENSORS_HANDLE_BASE+ID_A,
                 SENSOR_TYPE_ACCELEROMETER, 4.0f*9.81f, (4.0f*9.81f)/256.0f, 0.2f, { } },
-        { "AK8973 3-axis Magnetic field sensor",
-                "Asahi Kasei",
-                1, SENSORS_HANDLE_BASE+ID_M,
-                SENSOR_TYPE_MAGNETIC_FIELD, 2000.0f, 1.0f/16.0f, 6.8f, { } },
-        { "AK8973 Orientation sensor",
-                "Asahi Kasei",
-                1, SENSORS_HANDLE_BASE+ID_O,
-                SENSOR_TYPE_ORIENTATION, 360.0f, 1.0f, 7.0f, { } },
+		{ "BMA150 Temperature sensor",
+				"Bosh",
+				1, SENSORS_HANDLE_BASE+ID_T,
+				SENSOR_TYPE_TEMPERATURE,
+				80.0f,0.5f,0.0f,{}
+        },
         { "CM3602 Proximity sensor",
                 "Capella Microsystems",
                 1, SENSORS_HANDLE_BASE+ID_P,
@@ -163,7 +156,7 @@ const struct sensors_module_t HAL_MODULE_INFO_SYM = {
         .version_major = 1,
         .version_minor = 0,
         .id = SENSORS_HARDWARE_MODULE_ID,
-        .name = "AK8973A & CM3602 Sensors Module",
+        .name = "BMA150 & CM3602 Sensors Module",
         .author = "The Android Open Source Project",
         .methods = &sensors_module_methods,
     },
@@ -172,7 +165,7 @@ const struct sensors_module_t HAL_MODULE_INFO_SYM = {
 
 /*****************************************************************************/
 
-#define AKM_DEVICE_NAME     "/dev/akm8973_aot"
+#define BMA_DEVICE_NAME		"/dev/bma150"
 #define CM_DEVICE_NAME      "/dev/cm3602"
 #define LS_DEVICE_NAME      "/dev/lightsensor"
 
@@ -203,10 +196,10 @@ const struct sensors_module_t HAL_MODULE_INFO_SYM = {
 
 
 // conversion of acceleration data to SI units (m/s^2)
-#define CONVERT_A                   (GRAVITY_EARTH / LSG)
-#define CONVERT_A_X                 (-CONVERT_A)
+#define CONVERT_A                   (GRAVITY_EARTH / (256.0f))//LSG)
+#define CONVERT_A_X                 (CONVERT_A)
 #define CONVERT_A_Y                 (CONVERT_A)
-#define CONVERT_A_Z                 (-CONVERT_A)
+#define CONVERT_A_Z                 (CONVERT_A)
 
 // conversion of magnetic data to uT units
 #define CONVERT_M                   (1.0f/16.0f)
@@ -218,7 +211,7 @@ const struct sensors_module_t HAL_MODULE_INFO_SYM = {
 
 /*****************************************************************************/
 
-static int open_inputs(int mode, int *akm_fd, int *p_fd, int *l_fd)
+static int open_inputs(int mode, int *bma_fd, int *p_fd, int *l_fd)
 {
     /* scan all input drivers and look for "compass" */
     int fd = -1;
@@ -233,7 +226,7 @@ static int open_inputs(int mode, int *akm_fd, int *p_fd, int *l_fd)
     strcpy(devname, dirname);
     filename = devname + strlen(devname);
     *filename++ = '/';
-    *akm_fd = *p_fd = -1;
+    *bma_fd = *p_fd = -1;
     while((de = readdir(dir))) {
         if(de->d_name[0] == '.' &&
            (de->d_name[1] == '\0' ||
@@ -246,9 +239,9 @@ static int open_inputs(int mode, int *akm_fd, int *p_fd, int *l_fd)
             if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), &name) < 1) {
                 name[0] = '\0';
             }
-            if (!strcmp(name, "compass")) {
-                LOGV("using %s (name=%s)", devname, name);
-                *akm_fd = fd;
+			if (!strcmp(name, "bma150")) {
+				LOGV("using %s (name=%s)", devname, name);
+                *bma_fd = fd;
             }
             else if (!strcmp(name, "proximity")) {
                 LOGV("using %s (name=%s)", devname, name);
@@ -265,8 +258,8 @@ static int open_inputs(int mode, int *akm_fd, int *p_fd, int *l_fd)
     closedir(dir);
 
     fd = 0;
-    if (*akm_fd < 0) {
-        LOGE("Couldn't find or open 'compass' driver (%s)", strerror(errno));
+	if (*bma_fd < 0) {
+	    LOGE("Couldn't find or open 'BMA' driver (%s)", strerror(errno));
         fd = -1;
     }
     if (*p_fd < 0) {
@@ -280,101 +273,112 @@ static int open_inputs(int mode, int *akm_fd, int *p_fd, int *l_fd)
     return fd;
 }
 
-static int open_akm(struct sensors_control_context_t* dev)
+static int open_bma(struct sensors_control_context_t* dev)
 {
-    if (dev->akmd_fd < 0) {
-        dev->akmd_fd = open(AKM_DEVICE_NAME, O_RDONLY);
-        LOGV("%s, fd=%d", __PRETTY_FUNCTION__, dev->akmd_fd);
-        LOGE_IF(dev->akmd_fd<0, "Couldn't open %s (%s)",
-                AKM_DEVICE_NAME, strerror(errno));
-        if (dev->akmd_fd >= 0) {
+    if (dev->bma_fd < 0) {
+		int status;
+		char buf[5] = {0x14,0,0,0,0};
+		
+        dev->bma_fd = open(BMA_DEVICE_NAME, O_RDONLY);
+        LOGV("%s, fd=%d", __PRETTY_FUNCTION__, dev->bma_fd);
+        LOGE_IF(dev->bma_fd<0, "Couldn't open %s (%s)",
+                BMA_DEVICE_NAME, strerror(errno));
+        if (dev->bma_fd >= 0) {
             dev->active_sensors &= ~SENSORS_AKM_GROUP;
         }
     }
-    return dev->akmd_fd;
+    return dev->bma_fd;
 }
 
-static void close_akm(struct sensors_control_context_t* dev)
+static void close_bma(struct sensors_control_context_t* dev)
 {
-    if (dev->akmd_fd >= 0) {
-        LOGV("%s, fd=%d", __PRETTY_FUNCTION__, dev->akmd_fd);
-        close(dev->akmd_fd);
-        dev->akmd_fd = -1;
+    if (dev->bma_fd >= 0) {
+        LOGV("%s, fd=%d", __PRETTY_FUNCTION__, dev->bma_fd);
+        close(dev->bma_fd);
+        dev->bma_fd = -1;
     }
 }
-
-static uint32_t read_akm_sensors_state(int fd)
+static uint32_t read_bma_sensors_state(int fd)
 {
     short flags;
+	int ret;
     uint32_t sensors = 0;
+	char buf[1] = {0};
+	
     // read the actual value of all sensors
-    if (!ioctl(fd, ECS_IOCTL_APP_GET_MFLAG, &flags)) {
-        if (flags)  sensors |= SENSORS_AKM_ORIENTATION;
-        else        sensors &= ~SENSORS_AKM_ORIENTATION;
+	ret = ioctl(fd, BMA_IOCTL_ARE_YOU_SLEEPING, &buf);
+    if ((ret < 0) || (buf[0] == 1))
+	{
+        sensors &= ~SENSORS_AKM_ACCELERATION;
+		sensors &= ~SENSORS_AKM_TEMPERATURE;
+		LOGE("read_bma_sensors_state, BMA is not active: sensors=0x%x, ret=%d\n",sensors,ret);
     }
-    if (!ioctl(fd, ECS_IOCTL_APP_GET_AFLAG, &flags)) {
-        if (flags)  sensors |= SENSORS_AKM_ACCELERATION;
-        else        sensors &= ~SENSORS_AKM_ACCELERATION;
-    }
-    if (!ioctl(fd, ECS_IOCTL_APP_GET_TFLAG, &flags)) {
-        if (flags)  sensors |= SENSORS_AKM_TEMPERATURE;
-        else        sensors &= ~SENSORS_AKM_TEMPERATURE;
-    }
-    if (!ioctl(fd, ECS_IOCTL_APP_GET_MVFLAG, &flags)) {
-        if (flags)  sensors |= SENSORS_AKM_MAGNETIC_FIELD;
-        else        sensors &= ~SENSORS_AKM_MAGNETIC_FIELD;
-    }
+	else
+	{
+		sensors |= SENSORS_AKM_ACCELERATION;
+		sensors |= SENSORS_AKM_TEMPERATURE;
+		LOGE("read_bma_sensors_state, BMA is active: sensors=0x%x\n",sensors);
+	}
+    
     return sensors;
 }
 
-static uint32_t enable_disable_akm(struct sensors_control_context_t *dev,
+#define BMA_RETRY 10
+static uint32_t enable_disable_bma(struct sensors_control_context_t *dev,
                                    uint32_t active, uint32_t sensors,
                                    uint32_t mask)
 {
-    uint32_t now_active_akm_sensors;
+    uint32_t now_active_bma_sensors;
 
-    int fd = open_akm(dev);
+    int fd = open_bma(dev);
     if (fd < 0)
         return 0;
 
-    LOGV("(before) akm sensors = %08x, real = %08x",
-         sensors, read_akm_sensors_state(fd));
-
+    LOGE("enable_disable_bma: (before) bma sensors = %08x, real = %08x, mask = %08x",
+         sensors, read_bma_sensors_state(fd), mask);
+	LOGE("SENSORS_AKM_ACCELERATION=%08x, SENSORS_AKM_TEMPERATURE=%08x, SENSORS_AKM_GROUP=%08x",
+			SENSORS_AKM_ACCELERATION , SENSORS_AKM_TEMPERATURE, SENSORS_AKM_GROUP);
+			
     short flags;
-    if (mask & SENSORS_AKM_ORIENTATION) {
-        flags = (sensors & SENSORS_AKM_ORIENTATION) ? 1 : 0;
-        if (ioctl(fd, ECS_IOCTL_APP_SET_MFLAG, &flags) < 0) {
-            LOGE("ECS_IOCTL_APP_SET_MFLAG error (%s)", strerror(errno));
-        }
-    }
+	
+	//enable/disable BMA150 sensor
     if (mask & SENSORS_AKM_ACCELERATION) {
+		char buf[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+		int mode, status, retries = BMA_RETRY;
+		
         flags = (sensors & SENSORS_AKM_ACCELERATION) ? 1 : 0;
-        if (ioctl(fd, ECS_IOCTL_APP_SET_AFLAG, &flags) < 0) {
-            LOGE("ECS_IOCTL_APP_SET_AFLAG error (%s)", strerror(errno));
-        }
+		if (flags)
+		{
+			LOGE("enable_disable_bma: BMA_MODE_NORMAL!\n");
+			mode = BMA_MODE_NORMAL;
+		}
+		else
+		{
+			LOGE("enable_disable_bma: BMA_MODE_SLEEP!\n");
+			mode = BMA_MODE_SLEEP;
+		}
+		buf[0] = mode;
+		do {
+			status = ioctl(fd, BMA_IOCTL_SET_MODE, buf);
+		} while( status < 0 && retries-- > 0 );
+		if (status < 0) {
+			LOGE("activate: IGNORING error setting mode after %d retries (fd=%d, mode=%d, result=%d)", BMA_RETRY, fd, mode, status);
+		}
     }
+	//emulate temp sensor: do nothing
     if (mask & SENSORS_AKM_TEMPERATURE) {
         flags = (sensors & SENSORS_AKM_TEMPERATURE) ? 1 : 0;
-        if (ioctl(fd, ECS_IOCTL_APP_SET_TFLAG, &flags) < 0) {
-            LOGE("ECS_IOCTL_APP_SET_TFLAG error (%s)", strerror(errno));
-        }
-    }
-    if (mask & SENSORS_AKM_MAGNETIC_FIELD) {
-        flags = (sensors & SENSORS_AKM_MAGNETIC_FIELD) ? 1 : 0;
-        if (ioctl(fd, ECS_IOCTL_APP_SET_MVFLAG, &flags) < 0) {
-            LOGE("ECS_IOCTL_APP_SET_MVFLAG error (%s)", strerror(errno));
-        }
+		LOGE("enable_disable_bma: enable TEMP=%d but do nothing\n",flags);
     }
 
-    now_active_akm_sensors = read_akm_sensors_state(fd);
+    now_active_bma_sensors = read_bma_sensors_state(fd);
 
-    LOGV("(after) akm sensors = %08x, real = %08x",
-         sensors, now_active_akm_sensors);
+    LOGE("enable_disable_bma: (after) bma sensors = %08x, real = %08x", sensors, now_active_bma_sensors);
 
     if (!sensors)
-        close_akm(dev);
+        close_bma(dev);
 
-    return now_active_akm_sensors;
+    return now_active_bma_sensors;
 }
 
 static uint32_t read_cm_sensors_state(int fd)
@@ -514,15 +518,15 @@ static int enable_disable_ls(struct sensors_control_context_t *dev,
 static native_handle_t* control__open_data_source(struct sensors_control_context_t *dev)
 {
     native_handle_t* handle;
-    int akm_fd, p_fd, l_fd;
+    int bma_fd, p_fd, l_fd;
 
-    if (open_inputs(O_RDONLY, &akm_fd, &p_fd, &l_fd) < 0 ||
-            akm_fd < 0 || p_fd < 0 || l_fd < 0) {
+    if (open_inputs(O_RDONLY, &bma_fd, &p_fd, &l_fd) < 0 ||
+            bma_fd < 0 || p_fd < 0 || l_fd < 0) {
         return NULL;
     }
 
     handle = native_handle_create(3, 0);
-    handle->data[0] = akm_fd;
+    handle->data[0] = bma_fd;
     handle->data[1] = p_fd;
     handle->data[2] = l_fd;
 
@@ -549,11 +553,11 @@ static int control__activate(struct sensors_control_context_t *dev,
             changed = SUPPORTED_SENSORS;
 
         dev->active_sensors =
-            enable_disable_akm(dev,
+            enable_disable_bma(dev,
                                active & SENSORS_AKM_GROUP,
                                new_sensors & SENSORS_AKM_GROUP,
                                changed & SENSORS_AKM_GROUP) |
-            enable_disable_cm(dev,
+			enable_disable_cm(dev,
                               active & SENSORS_CM_GROUP,
                               new_sensors & SENSORS_CM_GROUP,
                               changed & SENSORS_CM_GROUP) |
@@ -569,11 +573,11 @@ static int control__activate(struct sensors_control_context_t *dev,
 static int control__set_delay(struct sensors_control_context_t *dev, int32_t ms)
 {
 #ifdef ECS_IOCTL_APP_SET_DELAY
-    if (dev->akmd_fd <= 0) {
+    if (dev->bma_fd <= 0) {
         return -1;
     }
     short delay = ms;
-    if (!ioctl(dev->akmd_fd, ECS_IOCTL_APP_SET_DELAY, &delay)) {
+    if (!ioctl(dev->bma_fd, ECS_IOCTL_APP_SET_DELAY, &delay)) {
         return -errno;
     }
     return 0;
@@ -585,9 +589,9 @@ static int control__set_delay(struct sensors_control_context_t *dev, int32_t ms)
 static int control__wake(struct sensors_control_context_t *dev)
 {
     int err = 0;
-    int akm_fd, p_fd, l_fd;
-    if (open_inputs(O_RDWR, &akm_fd, &p_fd, &l_fd) < 0 ||
-            akm_fd < 0 || p_fd < 0 || l_fd < 0) {
+    int bma_fd, p_fd, l_fd;
+    if (open_inputs(O_RDWR, &bma_fd, &p_fd, &l_fd) < 0 ||
+            bma_fd < 0 || p_fd < 0 || l_fd < 0) {
         return -1;
     }
 
@@ -596,10 +600,10 @@ static int control__wake(struct sensors_control_context_t *dev)
     event[0].code = SYN_CONFIG;
     event[0].value = 0;
 
-    err = write(akm_fd, event, sizeof(event));
-    LOGV_IF(err<0, "control__wake(compass), fd=%d (%s)",
-            akm_fd, strerror(errno));
-    close(akm_fd);
+    err = write(bma_fd, event, sizeof(event));
+    LOGV_IF(err<0, "control__wake(bma), fd=%d (%s)",
+            bma_fd, strerror(errno));
+    close(bma_fd);
 
     err = write(p_fd, event, sizeof(event));
     LOGV_IF(err<0, "control__wake(proximity), fd=%d (%s)",
@@ -630,8 +634,6 @@ static int data__data_open(struct sensors_data_context_t *dev, native_handle_t* 
     }
 
     dev->sensors[ID_A].sensor = SENSOR_TYPE_ACCELEROMETER;
-    dev->sensors[ID_M].sensor = SENSOR_TYPE_MAGNETIC_FIELD;
-    dev->sensors[ID_O].sensor = SENSOR_TYPE_ORIENTATION;
     dev->sensors[ID_T].sensor = SENSOR_TYPE_TEMPERATURE;
     dev->sensors[ID_P].sensor = SENSOR_TYPE_PROXIMITY;
     dev->sensors[ID_L].sensor = SENSOR_TYPE_LIGHT;
@@ -639,7 +641,7 @@ static int data__data_open(struct sensors_data_context_t *dev, native_handle_t* 
     dev->events_fd[0] = dup(handle->data[0]);
     dev->events_fd[1] = dup(handle->data[1]);
     dev->events_fd[2] = dup(handle->data[2]);
-    LOGV("data__data_open: compass fd = %d", handle->data[0]);
+    LOGV("data__data_open: bma fd = %d", handle->data[0]);
     LOGV("data__data_open: proximity fd = %d", handle->data[1]);
     LOGV("data__data_open: light fd = %d", handle->data[2]);
     // Framework will close the handle
@@ -704,13 +706,15 @@ static int pick_sensor(struct sensors_data_context_t *dev,
     return -1;
 }
 
-static uint32_t data__poll_process_akm_abs(struct sensors_data_context_t *dev,
+static uint32_t data__poll_process_bma_abs(struct sensors_data_context_t *dev,
                                            int fd __attribute__((unused)),
                                            struct input_event *event)
 {
     uint32_t new_sensors = 0;
+	float corrTemp; 
+	
     if (event->type == EV_ABS) {
-        LOGV("compass type: %d code: %d value: %-5d time: %ds",
+        LOGV("bma type: %d code: %d value: %-5d time: %ds",
              event->type, event->code, event->value,
              (int)event->time.tv_sec);
         switch (event->code) {
@@ -726,7 +730,7 @@ static uint32_t data__poll_process_akm_abs(struct sensors_data_context_t *dev,
             new_sensors |= SENSORS_AKM_ACCELERATION;
             dev->sensors[ID_A].acceleration.z = event->value * CONVERT_A_Z;
             break;
-        case EVENT_TYPE_MAGV_X:
+/*        case EVENT_TYPE_MAGV_X:
             new_sensors |= SENSORS_AKM_MAGNETIC_FIELD;
             dev->sensors[ID_M].magnetic.x = event->value * CONVERT_M_X;
             break;
@@ -749,10 +753,11 @@ static uint32_t data__poll_process_akm_abs(struct sensors_data_context_t *dev,
         case EVENT_TYPE_ROLL:
             new_sensors |= SENSORS_AKM_ORIENTATION;
             dev->sensors[ID_O].orientation.roll = -event->value;
-            break;
+            break;*/
         case EVENT_TYPE_TEMPERATURE:
             new_sensors |= SENSORS_AKM_TEMPERATURE;
-            dev->sensors[ID_T].temperature = event->value;
+			corrTemp = (event->value - 60.0)/2.0;
+            dev->sensors[ID_T].temperature = corrTemp;
             break;
         case EVENT_TYPE_STEP_COUNT:
             // step count (only reported in MODE_FFD)
@@ -762,13 +767,13 @@ static uint32_t data__poll_process_akm_abs(struct sensors_data_context_t *dev,
             // accuracy of the calibration (never returned!)
             //LOGV("G-Sensor status %d", event->value);
             break;
-        case EVENT_TYPE_ORIENT_STATUS: {
+/*        case EVENT_TYPE_ORIENT_STATUS: {
             // accuracy of the calibration
             uint32_t v = (uint32_t)(event->value & SENSOR_STATE_MASK);
             LOGV_IF(dev->sensors[ID_O].orientation.status != (uint8_t)v,
                     "M-Sensor status %d", v);
             dev->sensors[ID_O].orientation.status = (uint8_t)v;
-        }
+        }*/
             break;
         }
     }
@@ -839,12 +844,12 @@ static void data__poll_process_syn(struct sensors_data_context_t *dev,
 
 static int data__poll(struct sensors_data_context_t *dev, sensors_data_t* values)
 {
-    int akm_fd = dev->events_fd[0];
+    int bma_fd = dev->events_fd[0];
     int cm_fd = dev->events_fd[1];
     int ls_fd = dev->events_fd[2];
 
-    if (akm_fd < 0) {
-        LOGE("invalid compass file descriptor, fd=%d", akm_fd);
+    if (bma_fd < 0) {
+        LOGE("invalid compass file descriptor, fd=%d", bma_fd);
         return -1;
     }
 
@@ -867,7 +872,7 @@ static int data__poll(struct sensors_data_context_t *dev, sensors_data_t* values
     // wait until we get a complete event for an enabled sensor
     uint32_t new_sensors = 0;
     while (1) {
-        /* read the next event; first, read the compass event, then the
+        /* read the next event; first, read the gsensor event, then the
            proximity event */
         struct input_event event;
         int got_syn = 0;
@@ -877,35 +882,35 @@ static int data__poll(struct sensors_data_context_t *dev, sensors_data_t* values
         int n;
 
         FD_ZERO(&rfds);
-        FD_SET(akm_fd, &rfds);
+        FD_SET(bma_fd, &rfds);
         FD_SET(cm_fd, &rfds);
         FD_SET(ls_fd, &rfds);
-        n = select(__MAX(akm_fd, __MAX(cm_fd, ls_fd)) + 1, &rfds,
+        n = select(__MAX(bma_fd, __MAX(cm_fd, ls_fd)) + 1, &rfds,
                    NULL, NULL, NULL);
         LOGV("return from select: %d\n", n);
         if (n < 0) {
             LOGE("%s: error from select(%d, %d): %s",
                  __FUNCTION__,
-                 akm_fd, cm_fd, strerror(errno));
+                 bma_fd, cm_fd, strerror(errno));
             return -1;
         }
 
-        if (FD_ISSET(akm_fd, &rfds)) {
-            nread = read(akm_fd, &event, sizeof(event));
+        if (FD_ISSET(bma_fd, &rfds)) {
+            nread = read(bma_fd, &event, sizeof(event));
             if (nread == sizeof(event)) {
-                new_sensors |= data__poll_process_akm_abs(dev, akm_fd, &event);
-                LOGV("akm abs %08x", new_sensors);
+                new_sensors |= data__poll_process_bma_abs(dev, bma_fd, &event);
+                LOGV("bma abs %08x", new_sensors);
                 got_syn = event.type == EV_SYN;
                 exit = got_syn && event.code == SYN_CONFIG;
                 if (got_syn) {
-                    LOGV("akm syn %08x", new_sensors);
+                    LOGV("bma syn %08x", new_sensors);
                     data__poll_process_syn(dev, &event, new_sensors);
                     new_sensors = 0;
                 }
             }
-            else LOGE("akm read too small %d", nread);
+            else LOGE("bma read too small %d", nread);
         }
-        else LOGV("akm fd is not set");
+        else LOGV("bma fd is not set");
 
         if (FD_ISSET(cm_fd, &rfds)) {
             nread = read(cm_fd, &event, sizeof(event));
@@ -963,7 +968,7 @@ static int control__close(struct hw_device_t *dev)
     struct sensors_control_context_t* ctx =
         (struct sensors_control_context_t*)dev;
     if (ctx) {
-        close_akm(ctx);
+		close_bma(ctx);
         close_cm(ctx);
         close_ls(ctx);
         free(ctx);
@@ -991,7 +996,7 @@ static int open_sensors(const struct hw_module_t* module, const char* name,
         struct sensors_control_context_t *dev;
         dev = malloc(sizeof(*dev));
         memset(dev, 0, sizeof(*dev));
-        dev->akmd_fd = -1;
+		dev->bma_fd = -1;
         dev->cmd_fd = -1;
         dev->lsd_fd = -1;
         dev->device.common.tag = HARDWARE_DEVICE_TAG;
